@@ -1,0 +1,17 @@
+[project]
+name = "app-flow-for-remove"
+version = "0.1.0"
+description = "Nuke to ComfyUI Remove/Inpaint tool with two-process architecture"
+requires-python = ">=3.10"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [".git", ".venv", "__pycache__", "node_modules", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
