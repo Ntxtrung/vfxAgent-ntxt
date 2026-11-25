@@ -20,10 +20,10 @@
 - **Lệnh kiểm tra**: `python scripts/ci_check.py`
 
 ### F1 — Nuke Bridge: Đọc `Read` & Chuẩn hóa đầu vào cho ComfyUI
-- **Trạng thái**: `[ ] Planned`
-- **Mô tả**: Lấy metadata từ node `Read` (EXR/DPX/MOV/MP4, frame range, colorspace), convert sang chuẩn trung gian cho AI (PNG 16-bit sRGB/ACEScct) vào cache của shot.
+- **Trạng thái**: `[x] Verified`
+- **Mô tả**: Lấy metadata từ node `Read` (EXR/DPX/MOV/MP4, frame range, colorspace), convert sang chuẩn trung gian cho AI (PNG 16-bit sRGB/Output - sRGB) vào cache của shot.
 - **Thư mục**: `src/nuke_bridge/`, `src/contracts/`
-- **Chạy thử / Test**: `python -m pytest tests/test_nuke_bridge.py`
+- **Chạy thử / Test**: `python -m unittest discover -s tests -v`
 
 ### F2 — Tiến trình chính (Core API) & Kết nối ComfyUI
 - **Trạng thái**: `[ ] Planned`
@@ -53,10 +53,8 @@
 ---
 
 ## Handoff & Next Steps (Cập nhật mỗi lần push GitHub)
-- **Trạng thái hiện tại**: Đã hoàn tất `F0` (Rules, Skills, Feature Map, Cấu trúc 2 tiến trình, `ci_check.py` xanh).
+- **Trạng thái hiện tại**: Đã hoàn tất `F0` và `F1` (`src/contracts/models.py`, `src/nuke_bridge/colorspace.py`, `exporter.py`, `menu.py`, 5/5 unit tests pass, CI xanh).
 - **Việc cần làm tiếp theo**:
-  1. Khởi tạo Git repo & kết nối GitHub remote của người dùng, đẩy bản `F0`.
-  2. Triển khai `F1` (`src/contracts/` + `src/nuke_bridge/` đọc `Read` và chuẩn hóa colorspace).
-  3. Triển khai `F2` (`src/core/` FastAPI + ComfyUI API trên RTX 5060 Ti 16GB).
-  4. Triển khai `F3` (`src/ui/` giao diện vẽ mask/track/prompt/Before-After kiểu Neat Video).
-  5. Triển khai `F4` (Nuke auto-build node trả về colorspace gốc + `Keymix` giữ nguyên chất lượng).
+  1. Triển khai `F2` (`src/core/` FastAPI + ComfyUI API cổng `8188` trên RTX 5060 Ti 16GB).
+  2. Triển khai `F3` (`src/ui/` WebUI React + TypeScript App Window: vẽ mask/track/prompt/Before-After kiểu Neat Video).
+  3. Triển khai `F4` (`src/nuke_bridge/` auto-build node trả về colorspace gốc + `Keymix` giữ nguyên chất lượng).
