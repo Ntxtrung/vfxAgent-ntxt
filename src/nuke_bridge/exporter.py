@@ -43,6 +43,7 @@ def extract_shot_metadata(
     nuke_module: Any | None = None,
     first_frame: int | None = None,
     last_frame: int | None = None,
+    shot_id: str | None = None,
 ) -> ShotMetadata:
     """Read footage, format, and colorspace metadata from a Nuke Read node."""
     nuke = _get_nuke(nuke_module)
@@ -74,7 +75,7 @@ def extract_shot_metadata(
     working_cs = normalize_colorspace_name(working_knob, "linear")
     ai_prep_cs = resolve_ai_prep_colorspace(cm_mode, source_cs)
 
-    shot_id = _sanitize_shot_id(node_name)
+    shot_id = _sanitize_shot_id(shot_id or node_name)
     cache_dir = resolve_cache_dir(cache_root)
     cache_seq = (cache_dir / shot_id / "input" / f"{shot_id}_input.%04d.png").as_posix()
 
@@ -103,6 +104,7 @@ def export_prep_sequence(
     nuke_module: Any | None = None,
     first_frame: int | None = None,
     last_frame: int | None = None,
+    shot_id: str | None = None,
 ) -> ShotMetadata:
     """Render a 16-bit sRGB PNG prep sequence and write shot_metadata.json."""
     nuke = _get_nuke(nuke_module)
@@ -112,44 +114,47 @@ def export_prep_sequence(
         nuke_module=nuke,
         first_frame=first_frame,
         last_frame=last_frame,
+        shot_id=shot_id,
     )
 
     out_pattern = Path(metadata.cache_sequence_pattern)
     out_pattern.parent.mkdir(parents=True, exist_ok=True)
 
-    temp_nodes: list[Any] = []
+    cs_node = create_color_transform(
+        nuke, metadata.color_management, metadata.working_colorspace, metadata.ai_prep_colorspace
+    )
     try:
-        if metadata.color_management in (
-            ColorManagementMode.ACES_1_2,
-            ColorManagementMode.OCIO_CUSTOM,
-        ):
-            cs_node = nuke.nodes.OCIOColorSpace(
-                in_colorspace=metadata.working_colorspace,
-                out_colorspace=metadata.ai_prep_colorspace,
-            )
-        else:
-            cs_node = nuke.nodes.Colorspace(
-                colorspace_in=metadata.working_colorspace,
-                colorspace_out=metadata.ai_prep_colorspace,
-            )
         cs_node.setInput(0, read_node)
-        temp_nodes.append(cs_node)
-
-        write_node = nuke.nodes.Write(
-            file=metadata.cache_sequence_pattern,
-            file_type="png",
-            datatype="16 bit",
-            create_directories=True,
+        render_cache_png(
+            nuke,
+            cs_node,
+            metadata.cache_sequence_pattern,
+            metadata.first_frame,
+            metadata.last_frame,
         )
-        write_node["colorspace"].setValue("raw")
-        write_node.setInput(0, cs_node)
-        temp_nodes.append(write_node)
-
-        nuke.execute(write_node, metadata.first_frame, metadata.last_frame)
     finally:
-        for node in reversed(temp_nodes):
-            nuke.delete(node)
+        nuke.delete(cs_node)
 
     meta_path = out_pattern.parent.parent / "shot_metadata.json"
     metadata.save(meta_path)
     return metadata
+
+
+def create_color_transform(nuke: Any, mode: ColorManagementMode, source: str, target: str) -> Any:
+    """Create the project color transform between two explicit color spaces."""
+    if mode == ColorManagementMode.NUKE_DEFAULT:
+        return nuke.nodes.Colorspace(colorspace_in=source, colorspace_out=target)
+    return nuke.nodes.OCIOColorSpace(in_colorspace=source, out_colorspace=target)
+
+
+def render_cache_png(nuke: Any, node: Any, path: str, first: int, last: int) -> None:
+    """Render already-transformed pixels to disk without a second output transform."""
+    write_node = nuke.nodes.Write(
+        file=path, file_type="png", datatype="16 bit", create_directories=True
+    )
+    try:
+        write_node["colorspace"].setValue("raw")
+        write_node.setInput(0, node)
+        nuke.execute(write_node, first, last)
+    finally:
+        nuke.delete(write_node)

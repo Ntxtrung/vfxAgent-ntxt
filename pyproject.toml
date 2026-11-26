@@ -5,7 +5,7 @@ description = "Nuke to ComfyUI Remove/Inpaint tool with two-process architecture
 requires-python = ">=3.10"
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py310"
 line-length = 100
 exclude = [".git", ".venv", "__pycache__", "node_modules", "logs"]
 

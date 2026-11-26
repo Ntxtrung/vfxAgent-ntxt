@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from enum import StrEnum
+from enum import Enum
 from pathlib import Path
 
 
-class ColorManagementMode(StrEnum):
+class _StringEnum(str, Enum):
+    """Use string values on both Nuke's Python 3.10 and newer runtimes."""
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class ColorManagementMode(_StringEnum):
     """Supported Foundry Nuke color management modes."""
 
     ACES_1_2 = "aces_1_2"
@@ -16,7 +23,7 @@ class ColorManagementMode(StrEnum):
     OCIO_CUSTOM = "ocio_custom"
 
 
-class MediaKind(StrEnum):
+class MediaKind(_StringEnum):
     """Supported footage container/sequence types from Nuke Read nodes."""
 
     EXR = "exr"
@@ -26,7 +33,7 @@ class MediaKind(StrEnum):
     PNG_SEQ = "png_seq"
 
 
-class JobStatus(StrEnum):
+class JobStatus(_StringEnum):
     """Lifecycle states for an asynchronous Core removal/inpaint job."""
 
     PENDING = "pending"
@@ -35,12 +42,13 @@ class JobStatus(StrEnum):
     FAILED = "failed"
 
 
-class RemoveMode(StrEnum):
+class RemoveMode(_StringEnum):
     """Inpainting/removal strategies supported by the Core worker."""
 
     TEMPORAL_PROPAINTER = "temporal_propainter"
     CLEAN_PLATE_REF = "clean_plate_ref"
     PROMPT_REF_INPAINT = "prompt_ref_inpaint"
+    SINGLE_FRAME_INPAINT = "single_frame_inpaint"
 
 
 @dataclass(slots=True)
@@ -63,6 +71,7 @@ class ShotMetadata:
     cache_sequence_pattern: str
     ocio_config_path: str = ""
     mask_input_pattern: str = ""
+    is_demo: bool = False
 
     def to_json(self) -> str:
         """Serialize metadata to formatted JSON."""
@@ -89,6 +98,7 @@ class ShotMetadata:
             cache_sequence_pattern=data["cache_sequence_pattern"],
             ocio_config_path=data.get("ocio_config_path", ""),
             mask_input_pattern=data.get("mask_input_pattern", ""),
+            is_demo=data.get("is_demo", False),
         )
 
     def save(self, path: Path) -> Path:
@@ -113,6 +123,7 @@ class RemoveJobRequest:
     mask_feather_px: int = 6
     seed: int = 42
     sam2_points: list[dict[str, float | int]] = field(default_factory=list)
+    negative_prompt: str = ""
 
 
 @dataclass(slots=True)
@@ -126,3 +137,4 @@ class RemoveJobResponse:
     result_sequence_pattern: str = ""
     result_mask_pattern: str = ""
     error_message: str = ""
+    apply_manifest_path: str = ""
