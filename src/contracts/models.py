@@ -50,6 +50,7 @@ class RemoveMode(_StringEnum):
     PROMPT_REF_INPAINT = "prompt_ref_inpaint"
     SINGLE_FRAME_INPAINT = "single_frame_inpaint"
     TRACKED_CLEAN_PLATE = "tracked_clean_plate"
+    SAM2_TRACK = "sam2_track"
 
 
 @dataclass(slots=True)
@@ -126,6 +127,7 @@ class RemoveJobRequest:
     sam2_points: list[dict[str, float | int]] = field(default_factory=list)
     negative_prompt: str = ""
     anchor_frame: int | None = None
+    mask_keyframes: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)

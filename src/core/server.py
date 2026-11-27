@@ -36,6 +36,7 @@ class JobCreatePayload(BaseModel):
     sam2_points: list[dict[str, float | int]] = Field(default_factory=list)
     negative_prompt: str = ""
     anchor_frame: int | None = None
+    mask_keyframes: list[int] = Field(default_factory=list)
 
 
 class ApplyPayload(BaseModel):
@@ -62,7 +63,7 @@ def create_app(config: CoreConfig | None = None) -> FastAPI:
     cfg = config or CoreConfig.from_env()
     logger = configure_core_logger(cfg.logs_dir)
     comfy = ComfyUIClient(base_url=cfg.comfyui_url)
-    manager = JobManager(cfg.cache_dir, comfy, logger, inpaint_checkpoint=cfg.inpaint_checkpoint)
+    manager = JobManager(cfg, comfy, logger)
 
     app = FastAPI(title="VFX Remove/Inpaint Core Worker", version="0.2.0")
     app.add_middleware(
@@ -117,16 +118,26 @@ def create_app(config: CoreConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Result frame {frame} not found")
         return FileResponse(path, media_type="image/png")
 
-    @app.get("/api/jobs/{job_id}/result/{frame}")
-    def get_job_result(job_id: str, frame: int) -> FileResponse:
+    def get_job_file(job_id: str, frame: int, *, mask: bool = False) -> FileResponse:
         try:
             job = manager.get_job(job_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        path = Path(job.result_sequence_pattern % frame)
+        pattern = job.result_mask_pattern if mask else job.result_sequence_pattern
+        if not pattern:
+            raise HTTPException(status_code=404, detail=f"Frame {frame} not available")
+        path = Path(pattern % frame)
         if job.status != JobStatus.COMPLETED or not path.is_file():
             raise HTTPException(status_code=404, detail=f"Result frame {frame} not available")
         return FileResponse(path, media_type="image/png")
+
+    @app.get("/api/jobs/{job_id}/result/{frame}")
+    def get_job_result(job_id: str, frame: int) -> FileResponse:
+        return get_job_file(job_id, frame)
+
+    @app.get("/api/jobs/{job_id}/mask/{frame}")
+    def get_job_mask(job_id: str, frame: int) -> FileResponse:
+        return get_job_file(job_id, frame, mask=True)
 
     @app.post("/api/shots/{shot_id}/mask/{frame}")
     def upload_mask(

@@ -269,6 +269,93 @@ class TestCoreAPI(unittest.TestCase):
             time.sleep(0.02)
         raise AssertionError(f"Job {job_id} did not finish")
 
+    def test_temporal_job_uses_sam2_keyframes_and_writes_one_patch_per_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "sam2.pt"
+            checkpoint.touch()
+            painter = root / "propainter"
+            (painter / "weights").mkdir(parents=True)
+            (painter / "inference_propainter.py").touch()
+            for name in ("ProPainter.pth", "raft-things.pth", "recurrent_flow_completion.pth"):
+                (painter / "weights" / name).touch()
+            cfg = CoreConfig(
+                cache_dir=root / "cache",
+                logs_dir=root / "logs",
+                sam2_checkpoint=checkpoint,
+                propainter_dir=painter,
+            )
+            client = TestClient(create_app(cfg))
+            demo = client.post("/api/shots/demo?shot_id=clip&num_frames=3").json()
+            metadata = replace(
+                ShotMetadata.from_json(json.dumps(demo)), width=32, height=24, is_demo=False
+            )
+            shot_dir = cfg.cache_dir / "clip"
+            metadata.save(shot_dir / "shot_metadata.json")
+            for frame in range(1001, 1004):
+                Image.new("RGB", (32, 24), (50, 60, 70)).save(
+                    metadata.cache_sequence_pattern % frame
+                )
+            authored = Image.new("L", (32, 24), 0)
+            authored.paste(128, (8, 6, 24, 18))
+            mask_data = io.BytesIO()
+            authored.save(mask_data, format="PNG")
+            response = client.post(
+                "/api/shots/clip/mask/1002",
+                files={"file": ("mask.png", mask_data.getvalue(), "image/png")},
+            )
+            self.assertEqual(response.status_code, 200)
+
+            def track(_cfg, frames, seeds, output):
+                self.assertEqual([path.name for path in seeds.glob("*.png")], ["000001.png"])
+                output.mkdir()
+                for index, _ in enumerate(sorted(frames.glob("*.png"))):
+                    authored.point(lambda value: 255 if value else 0).save(
+                        output / f"{index:06d}.png"
+                    )
+
+            def inpaint(_cfg, frames, masks, size, _fps):
+                self.assertEqual(len(list(masks.glob("*.png"))), 3)
+                output = frames.parent / "fake_propainter"
+                output.mkdir()
+                for index in range(3):
+                    Image.new("RGB", size, (100, 110, 120)).save(output / f"{index:04d}.png")
+                return output, size
+
+            payload = {
+                "shot_id": "clip",
+                "mode": "temporal_propainter",
+                "first_frame": 1001,
+                "last_frame": 1003,
+                "mask_keyframes": [1002],
+                "mask_expand_px": 0,
+                "mask_feather_px": 0,
+            }
+            with (
+                patch("src.core.job_manager.run_sam2", side_effect=track) as sampler,
+                patch("src.core.job_manager.run_propainter", side_effect=inpaint) as painter_run,
+            ):
+                response = client.post("/api/jobs", json=payload)
+                self.assertEqual(response.status_code, 200, response.text)
+                job = self._wait_for_job(client, response.json()["job_id"])
+                self.assertEqual(job["status"], "completed", job["error_message"])
+                sampler.assert_called_once()
+                painter_run.assert_called_once()
+            jid = job["job_id"]
+            for frame in range(1001, 1004):
+                response = client.get(f"/api/jobs/{jid}/result/{frame}")
+                self.assertEqual(response.status_code, 200)
+                with Image.open(io.BytesIO(response.content)) as patch_image:
+                    self.assertEqual(patch_image.getpixel((0, 0)), (50, 60, 70))
+                    self.assertEqual(patch_image.getpixel((10, 10)), (100, 110, 120))
+            mask = client.get(f"/api/jobs/{jid}/mask/1002")
+            self.assertEqual(mask.status_code, 200)
+            with Image.open(io.BytesIO(mask.content)) as authored_snapshot:
+                self.assertEqual(authored_snapshot.getpixel((10, 10)), 128)
+            manifest = json.loads(Path(job["apply_manifest_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["mask_keyframes"], [1002])
+            self.assertEqual(manifest["processing_mode"], "temporal_propainter")
+
 
 if __name__ == "__main__":
     unittest.main()

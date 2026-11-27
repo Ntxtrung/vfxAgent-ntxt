@@ -22,6 +22,16 @@ from src.contracts.models import (
     ShotMetadata,
 )
 from src.core.comfy_client import ComfyUIClient
+from src.core.config import CoreConfig
+from src.core.model_sequence import (
+    load_luminance_mask,
+    model_mask,
+    prepare_mask,
+    restore_patch,
+    run_propainter,
+    run_sam2,
+    validate_runtime,
+)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -32,16 +42,16 @@ class JobManager:
 
     def __init__(
         self,
-        cache_dir: Path,
+        config: CoreConfig,
         comfy_client: ComfyUIClient,
         logger: logging.Logger,
-        inpaint_checkpoint: str = "",
     ) -> None:
-        self.cache_dir = cache_dir
+        self.config = config
+        self.cache_dir = config.cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.comfy_client = comfy_client
         self.logger = logger
-        self.inpaint_checkpoint = inpaint_checkpoint
+        self.inpaint_checkpoint = config.inpaint_checkpoint
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="core-worker")
         self._jobs: dict[str, RemoveJobResponse] = {}
 
@@ -119,6 +129,9 @@ class JobManager:
         metadata = self.get_shot(request.shot_id)
         single_frame = request.mode == RemoveMode.SINGLE_FRAME_INPAINT
         sequence = request.mode == RemoveMode.TRACKED_CLEAN_PLATE
+        model_sequence = self._uses_model_sequence(request, metadata)
+        if request.mask_keyframes and not model_sequence:
+            raise ValueError("Mask keyframes require sam2_track or temporal_propainter")
         if single_frame or (sequence and not request.reference_image_path):
             if not self.inpaint_checkpoint:
                 raise ValueError("Set COMFYUI_INPAINT_CHECKPOINT to a local checkpoint name")
@@ -151,13 +164,15 @@ class JobManager:
                     raise ValueError(
                         "Upload the clean plate to the reference endpoint for this shot"
                     )
+        elif model_sequence:
+            self._validate_model_job(request, metadata)
         elif not metadata.is_demo:
-            raise ValueError("Nuke footage requires single_frame_inpaint or tracked_clean_plate")
+            raise ValueError("Unsupported removal mode for prepared footage")
         job_id = uuid.uuid4().hex[:12]
         shot_dir = self.cache_dir / metadata.shot_id
         result_dir = shot_dir / "result"
         mask_dir = shot_dir / "masks"
-        if single_frame or sequence:
+        if single_frame or sequence or model_sequence:
             result_dir = mask_dir = shot_dir / "jobs" / job_id
 
         job = RemoveJobResponse(
@@ -165,12 +180,51 @@ class JobManager:
             shot_id=metadata.shot_id,
             status=JobStatus.PENDING,
             progress=0.0,
-            result_sequence_pattern=(result_dir / f"{metadata.shot_id}_result.%04d.png").as_posix(),
+            result_sequence_pattern=(
+                ""
+                if request.mode == RemoveMode.SAM2_TRACK
+                else (result_dir / f"{metadata.shot_id}_result.%04d.png").as_posix()
+            ),
             result_mask_pattern=(mask_dir / f"{metadata.shot_id}_mask.%04d.png").as_posix(),
         )
         self._jobs[job_id] = job
         self._executor.submit(self._run_job, job_id, request, metadata)
         return job
+
+    def _uses_model_sequence(self, request: RemoveJobRequest, metadata: ShotMetadata) -> bool:
+        return request.mode == RemoveMode.SAM2_TRACK or (
+            request.mode == RemoveMode.TEMPORAL_PROPAINTER
+            and (
+                not metadata.is_demo
+                or self.config.propainter_dir is not None
+                or bool(request.mask_keyframes)
+            )
+        )
+
+    def _validate_model_job(self, request: RemoveJobRequest, metadata: ShotMetadata) -> None:
+        if (
+            not metadata.first_frame
+            <= request.first_frame
+            < request.last_frame
+            <= (metadata.last_frame)
+        ):
+            raise ValueError("Submit at least two frames within the prepared shot range")
+        if request.mode == RemoveMode.SAM2_TRACK and not request.mask_keyframes:
+            raise ValueError("Provide at least one mask keyframe for sam2_track")
+        if request.sam2_points:
+            raise ValueError("SAM 2 jobs use uploaded keyframe masks")
+        if any(
+            not request.first_frame <= frame <= request.last_frame
+            for frame in request.mask_keyframes
+        ):
+            raise ValueError("SAM 2 mask keyframes must be inside the requested job range")
+        if not 0 <= request.mask_expand_px <= 64 or not 0 <= request.mask_feather_px <= 64:
+            raise ValueError("Mask expand and feather must be between 0 and 64 pixels")
+        validate_runtime(
+            self.config,
+            use_sam2=bool(request.mask_keyframes),
+            use_propainter=request.mode == RemoveMode.TEMPORAL_PROPAINTER,
+        )
 
     def get_job(self, job_id: str) -> RemoveJobResponse:
         """Return current status of job_id."""
@@ -191,9 +245,15 @@ class JobManager:
         self.logger.info("Starting job %s for shot %s (%s)", job_id, metadata.shot_id, request.mode)
 
         try:
-            if request.mode in (RemoveMode.SINGLE_FRAME_INPAINT, RemoveMode.TRACKED_CLEAN_PLATE):
+            model_sequence = self._uses_model_sequence(request, metadata)
+            if model_sequence or request.mode in (
+                RemoveMode.SINGLE_FRAME_INPAINT,
+                RemoveMode.TRACKED_CLEAN_PLATE,
+            ):
                 if request.mode == RemoveMode.SINGLE_FRAME_INPAINT:
                     self._run_single_frame(job, request, metadata)
+                elif model_sequence:
+                    self._run_model_sequence(job, request, metadata)
                 else:
                     self._run_sequence(job, request, metadata)
                 job.stage = "completed"
@@ -246,6 +306,79 @@ class JobManager:
             job.error_message = str(exc)
             job.status = JobStatus.FAILED
             self.logger.exception("Job %s failed: %s", job_id, exc)
+
+    def _run_model_sequence(
+        self, job: RemoveJobResponse, request: RemoveJobRequest, metadata: ShotMetadata
+    ) -> None:
+        frames = range(request.first_frame, request.last_frame + 1)
+        size = (metadata.width, metadata.height)
+        directory = Path(job.result_mask_pattern % request.first_frame).resolve().parent
+        staged_frames = directory / "frames"
+        staged_masks = directory / "engine_masks"
+        seeds = directory / "sam2_seeds"
+        for folder in (staged_frames, staged_masks, seeds):
+            folder.mkdir(parents=True, exist_ok=True)
+        keyframes = set(request.mask_keyframes)
+        tracking_only = request.mode == RemoveMode.SAM2_TRACK
+        for index, frame in enumerate(frames):
+            job.current_frame = frame
+            source = self.frame_path(metadata.shot_id, "input", frame)
+            with Image.open(source) as plate:
+                if plate.size != size:
+                    raise ValueError(f"Invalid dimensions for input frame {frame}")
+                plate.convert("RGB").save(staged_frames / f"{index:06d}.png")
+            if not keyframes or frame in keyframes:
+                pathname = self.frame_path(metadata.shot_id, "mask", frame)
+                if not pathname.is_file():
+                    raise FileNotFoundError(f"Missing mask for frame {frame}: {pathname.name}")
+                target = seeds if keyframes else staged_masks
+                load_luminance_mask(pathname, size).save(target / f"{index:06d}.png")
+            job.progress = 0.20 * (index + 1) / len(frames)
+
+        raw_masks = staged_masks
+        if keyframes:
+            job.stage = "tracking_sam2"
+            job.current_frame = None
+            raw_masks = directory / "sam2_masks"
+            run_sam2(self.config, staged_frames, seeds, raw_masks)
+
+        job.stage = "preparing_masks"
+        for index, frame in enumerate(frames):
+            job.current_frame = frame
+            raw = raw_masks / f"{index:06d}.png"
+            if not raw.is_file():
+                raise FileNotFoundError(f"SAM 2 did not produce a mask for frame {frame}")
+            # Keep authored corrections, including soft edges, as the source for those frames.
+            source = seeds / raw.name if frame in keyframes else raw
+            matte = load_luminance_mask(source, size)
+            if not tracking_only:
+                matte = prepare_mask(matte, request.mask_expand_px, request.mask_feather_px)
+                model_mask(matte).save(staged_masks / raw.name)
+            matte.save(job.result_mask_pattern % frame)
+        if tracking_only:
+            return
+
+        job.stage = "inpainting_propainter"
+        job.progress = 0.50
+        job.current_frame = None
+        generated, expected_size = run_propainter(
+            self.config, staged_frames, staged_masks, size, metadata.fps
+        )
+        job.stage = "writing_frames"
+        for index, frame in enumerate(frames):
+            job.current_frame = frame
+            with (
+                Image.open(staged_frames / f"{index:06d}.png") as plate,
+                Image.open(generated / f"{index:04d}.png") as out,
+            ):
+                if out.size != expected_size:
+                    raise ValueError(f"Unexpected ProPainter patch dimensions at frame {frame}")
+                matte = load_luminance_mask(Path(job.result_mask_pattern % frame), size)
+                restore_patch(plate.convert("RGB"), out.convert("RGB"), matte).save(
+                    job.result_sequence_pattern % frame
+                )
+            job.progress = 0.85 + 0.14 * (index + 1) / len(frames)
+        self._write_job_manifest(job, request, metadata, "", request.first_frame)
 
     def _run_single_frame(
         self, job: RemoveJobResponse, request: RemoveJobRequest, metadata: ShotMetadata
@@ -419,6 +552,7 @@ class JobManager:
             "comfy_prompt_id": prompt_id,
             "processing_mode": request.mode.value,
             "anchor_frame": anchor_frame,
+            "mask_keyframes": sorted(set(request.mask_keyframes)),
             "shot_id": metadata.shot_id,
             "node_name": metadata.node_name,
             "file_pattern": metadata.file_pattern,
