@@ -32,17 +32,26 @@
 - **Thư mục**: `src/core/`
 - **Chạy thử / Test**: `python -m pytest tests/test_core_api.py`
 
-### F3 — Tiến trình giao diện (UI kiểu Neat Video)
-- **Trạng thái**: `[ ] Planned`
-- **Mô tả**: Cửa sổ UI riêng không làm đơ Nuke: Timeline từng frame, vẽ cọ/tẩy mask, click-to-mask & track SAM 2, chọn ảnh Reference/Clean-Plate, nhập Prompt, xem Before/After.
-- **Thư mục**: `src/ui/`
-- **Chạy thử / Test**: Khởi chạy 2 tiến trình qua `scripts/dev.py` (sẽ bổ sung khi vào code F2/F3).
+### F3 — Giao diện xem shot và chỉnh mask
 
-### F4 — Nuke Auto-Composite: Trả về Colorspace gốc & Merge giữ chất lượng gốc
-- **Trạng thái**: `[~] In Progress`. Đã có lệnh ghép một frame từ manifest của job ComfyUI.
-- **Mô tả**: Đọc patch và mask từ cache, chuyển patch về working colorspace của script rồi `Keymix` RGB lên `Read` gốc. `Switch` chỉ bật patch tại frame đã xử lý. Auto-composite theo chuỗi và grain vẫn trong kế hoạch.
-- **Thư mục**: `src/nuke_bridge/`
-- **Chạy thử**: Làm theo quy trình một frame bên dưới và kiểm tra `Difference` giữa `Read` gốc và output.
+- `[x] Verified` trên trình duyệt với job SAM 2 và ProPainter thực tế cho đoạn 1036–1038.
+- Giao diện riêng có timeline, phát hình, cọ và tẩy mask, tạo mask theo điểm SAM 2, lưu keyframe, nhập PNG mask hoặc ảnh clean plate, nhập prompt, theo dõi job và xem Before/After. Giao diện chỉ trao đổi với Core qua HTTP.
+- Chạy từ `src/ui/` qua launcher `scripts/dev.py` theo quy trình bên dưới.
+
+### F4 — Tự dựng graph ghép patch trong Nuke
+
+- `[x] Verified` trong Nuke 15.1. RGB ngoài mask trùng khớp plate ở cả 11 frame 1036–1046. Hai frame đối chứng 1035 và 1047 trùng khớp toàn khung. Tùy chọn feather và grain đã được render kiểm tra ở frame 1038.
+- `Apply Core Result` đọc manifest của một frame hoặc cả đoạn, chuyển patch từ màu cache về working colorspace, dùng `Keymix` để ghép RGB và dùng `Switch` để trả plate gốc ngoài phạm vi job.
+- Cầu nối ở `src/nuke_bridge/`.
+
+### Chạy từ Nuke qua UI rồi ghép kết quả
+
+1. Tại thư mục repo, chạy `npm ci --prefix src/ui`, rồi chạy `.venv/Scripts/python.exe scripts/dev.py`. Launcher mở Core và UI trong hai tiến trình và in URL của UI. Máy cần các dependency tương ứng với chế độ job sẽ dùng.
+2. Dùng cùng đường dẫn `CACHE_DIR` tuyệt đối cho Core và Nuke. Core đọc cấu hình từ môi trường hoặc `.env`. Nuke đọc biến môi trường khi khởi động. Thêm repo vào Python path của Nuke rồi đăng ký menu bằng `from src.nuke_bridge.menu import register_menu; register_menu()`.
+3. Chọn `Read` và tùy chọn chọn thêm một node chứa mask trong alpha. Mở **ComfyRemove → Open Remove/Inpaint UI**, chọn frame range và chờ Nuke xuất cache. Sau đó trình duyệt mở đúng shot.
+4. Chọn frame trên timeline. Vẽ mask hoặc nhập PNG. Với công cụ **Điểm SAM 2**, click thêm điểm dương, giữ Shift khi click để thêm điểm âm, rồi chọn **Tạo mask** và lưu kết quả ở frame cần làm keyframe. Ảnh clean plate được gắn với frame hiện tại khi tải lên.
+5. Chọn chế độ job, chạy và xem kết quả qua thanh Before/After trong sRGB. Tải manifest của job hoàn tất. Các đường dẫn trong manifest trỏ đến cache trên máy chạy Core.
+6. Trong Nuke, chọn `Read` gốc, mở **ComfyRemove → Apply Core Result** và chọn manifest. Với EXR trong project ACES, đặt rõ colorspace của nguồn trên `Read`, ví dụ `ACEScg` khi plate được mã hóa ACEScg. Kết nối Viewer với `Switch` mới. Dùng `Difference` để kiểm tra vùng ngoài matte và các frame ngay trước và sau đoạn.
 
 ### Chạy thử một frame EXR qua ComfyUI và ghép về Nuke
 
@@ -60,7 +69,7 @@ Core cắt vùng quanh mask và thu nhỏ đầu vào AI nếu cạnh dài vư�
 2. Dùng `export_prep_sequence` trong Nuke Bridge để chuẩn bị frame range. Tải một mask PNG cùng kích thước cho mỗi frame qua `POST /api/shots/{shot_id}/mask/{frame}`. Mask grayscale hoặc kênh đỏ RGB dùng giá trị trắng cho vùng sửa. Dùng mask đen cho frame cần giữ nguyên.
 3. Gửi `POST /api/jobs` với `mode: tracked_clean_plate`, `shot_id`, `first_frame` và `last_frame`. Có thể chỉ định `anchor_frame`, mặc định là giữa đoạn. Để tự dựng clean plate, điền `prompt` và cấu hình checkpoint ComfyUI như job một frame. Để dùng clean plate đã duyệt, tải PNG của frame mốc trong cùng AI prep colorspace qua `POST /api/shots/{shot_id}/reference`, rồi gửi `reference_image_path` trả về cùng `anchor_frame` tương ứng.
 4. Poll `GET /api/jobs/{job_id}`. Sequence báo `tracking_background`, `submitting_to_comfyui` và `waiting_for_comfyui` khi cần inpaint, rồi `writing_frames`. Job báo rõ frame nếu thiếu mask hoặc tracking mất bám. Khi hoàn thành, dùng `GET /api/jobs/{job_id}/result/{frame}` để xem patch. Mask theo frame được lưu cạnh patch để điều khiển độ hòa trộn trong Nuke.
-5. Manifest sequence lưu frame range, frame mốc, đường dẫn patch và mask, cùng colorspace cho F4. `tracking.json` lưu phép biến đổi frame về mốc. Luồng F4 tự dựng graph từ manifest sequence là hạng mục tiếp theo.
+5. Manifest sequence lưu frame range, frame mốc, đường dẫn patch và mask, cùng colorspace. `tracking.json` lưu phép biến đổi frame về mốc. Chọn manifest trong **Apply Core Result** để dựng graph ghép cả đoạn.
 
 Tracking nền hiện dùng một phép biến đổi toàn cục cho mỗi frame. Kết quả phù hợp nhất với đoạn ngắn đủ chi tiết nền chung. Camera parallax mạnh, đổi góc hoặc vùng nền bị che nhiều cần kiểm tra patch và mép mask trong Nuke.
 
@@ -88,8 +97,5 @@ Sau khi sửa cách đọc EXR ACES mặc định, đã xuất lại và chạy 
 ---
 
 ## Handoff & Next Steps (Cập nhật mỗi lần push GitHub)
-- **Trạng thái hiện tại**: F0, F1 và các luồng Core của F2 đã được xác minh. F4 tự ghép một frame. F3 chưa triển khai.
-- **Việc cần làm tiếp theo**:
-  1. Nối lệnh Apply của F4 với manifest sequence từ F2 và kiểm tra Difference trên toàn đoạn.
-  2. Triển khai F3 trên API job thực tế, bắt đầu từ chọn shot, xem patch và trạng thái job.
-  3. Thêm công cụ duyệt và sửa mask SAM 2 trên timeline khi triển khai F3.
+- F0–F4 đã qua các bài kiểm tra ghi ở trên. Kiểm thử F3 dùng shot 1036–1038, còn F4 kiểm tra cả đoạn 1036–1046 trên cùng plate EXR.
+- Nghiên cứu workflow inpaint khác và đánh giá độ ổn định theo thời gian ở đợt sau.

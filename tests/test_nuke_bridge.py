@@ -111,6 +111,9 @@ class TestColorspaceAndContracts(unittest.TestCase):
 
     def test_detect_media_kind(self) -> None:
         self.assertEqual(detect_media_kind("D:/plates/shot_01.%04d.exr"), MediaKind.EXR)
+        self.assertEqual(
+            detect_media_kind("D:/shot plates/shot 01.####.exr 1036-1046"), MediaKind.EXR
+        )
         self.assertEqual(detect_media_kind("D:/plates/shot_01.%04d.DPX"), MediaKind.DPX)
         self.assertEqual(detect_media_kind("D:/plates/clip.mov"), MediaKind.MOV)
         self.assertEqual(detect_media_kind("D:/plates/clip.mp4"), MediaKind.MP4)

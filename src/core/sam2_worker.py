@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from bisect import bisect_right
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,12 +14,19 @@ from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor
 
 
-def track(frames: Path, seeds: Path, output: Path, model_config: str, checkpoint: str) -> None:
+def track(
+    frames: Path,
+    seeds: Path,
+    output: Path,
+    model_config: str,
+    checkpoint: str,
+    points: Path | None = None,
+) -> None:
     sources = sorted(frames.glob("*.png"))
     keyframes = {int(path.stem): path for path in seeds.glob("*.png")}
     indices = sorted(keyframes)
     output.mkdir(parents=True, exist_ok=True)
-    if not indices:
+    if not indices and points is None:
         raise ValueError("SAM 2 requires at least one keyframe mask")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -34,6 +42,20 @@ def track(frames: Path, seeds: Path, output: Path, model_config: str, checkpoint
             with Image.open(source) as image:
                 image.convert("RGB").save(Path(video) / f"{index:06d}.jpg", quality=97)
         state = predictor.init_state(video, offload_video_to_cpu=True)
+        if points is not None:
+            with Image.open(sources[0]) as frame:
+                width, height = frame.size
+            prompts = json.loads(points.read_text(encoding="utf-8"))
+            coords = np.float32(
+                [[point["x"] * (width - 1), point["y"] * (height - 1)] for point in prompts]
+            )
+            labels = np.int32([point["label"] for point in prompts])
+            _, _, logits = predictor.add_new_points_or_box(
+                state, frame_idx=0, obj_id=1, points=coords, labels=labels
+            )
+            mask = (logits[0, 0] > 0).cpu().numpy().astype(np.uint8) * 255
+            Image.fromarray(mask).save(output / "000000.png")
+            return
         for index in indices:
             with Image.open(keyframes[index]) as image:
                 mask = np.array(image.convert("L")) >= 128
@@ -66,8 +88,9 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument("model_config")
     parser.add_argument("checkpoint")
+    parser.add_argument("--points", type=Path)
     args = parser.parse_args()
-    track(args.frames, args.seeds, args.output, args.model_config, args.checkpoint)
+    track(args.frames, args.seeds, args.output, args.model_config, args.checkpoint, args.points)
 
 
 if __name__ == "__main__":

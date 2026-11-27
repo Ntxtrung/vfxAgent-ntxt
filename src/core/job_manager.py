@@ -202,17 +202,22 @@ class JobManager:
         )
 
     def _validate_model_job(self, request: RemoveJobRequest, metadata: ShotMetadata) -> None:
+        point_job = request.mode == RemoveMode.SAM2_TRACK and bool(request.sam2_points)
         if (
             not metadata.first_frame
             <= request.first_frame
-            < request.last_frame
-            <= (metadata.last_frame)
+            <= request.last_frame
+            <= metadata.last_frame
         ):
+            raise ValueError("Submit frames within the prepared shot range")
+        if request.first_frame == request.last_frame and not point_job:
             raise ValueError("Submit at least two frames within the prepared shot range")
-        if request.mode == RemoveMode.SAM2_TRACK and not request.mask_keyframes:
-            raise ValueError("Provide at least one mask keyframe for sam2_track")
-        if request.sam2_points:
-            raise ValueError("SAM 2 jobs use uploaded keyframe masks")
+        if request.sam2_points and not point_job:
+            raise ValueError("Point prompts require a sam2_track job")
+        if point_job:
+            self._validate_point_prompts(request)
+        elif request.mode == RemoveMode.SAM2_TRACK and not request.mask_keyframes:
+            raise ValueError("Provide a mask keyframe or point prompt for sam2_track")
         if any(
             not request.first_frame <= frame <= request.last_frame
             for frame in request.mask_keyframes
@@ -222,9 +227,21 @@ class JobManager:
             raise ValueError("Mask expand and feather must be between 0 and 64 pixels")
         validate_runtime(
             self.config,
-            use_sam2=bool(request.mask_keyframes),
+            use_sam2=bool(request.mask_keyframes) or point_job,
             use_propainter=request.mode == RemoveMode.TEMPORAL_PROPAINTER,
         )
+
+    @staticmethod
+    def _validate_point_prompts(request: RemoveJobRequest) -> None:
+        if request.first_frame != request.last_frame or request.mask_keyframes:
+            raise ValueError("Run point prompts on one frame, then save the mask as a keyframe")
+        points = request.sam2_points
+        valid = all(
+            0 <= p.get("x", -1) <= 1 and 0 <= p.get("y", -1) <= 1 and p.get("label") in (0, 1)
+            for p in points
+        )
+        if len(points) > 64 or not valid or not any(p["label"] == 1 for p in points):
+            raise ValueError("Provide 1–64 normalized SAM 2 points, including a positive point")
 
     def get_job(self, job_id: str) -> RemoveJobResponse:
         """Return current status of job_id."""
@@ -327,7 +344,7 @@ class JobManager:
                 if plate.size != size:
                     raise ValueError(f"Invalid dimensions for input frame {frame}")
                 plate.convert("RGB").save(staged_frames / f"{index:06d}.png")
-            if not keyframes or frame in keyframes:
+            if not request.sam2_points and (not keyframes or frame in keyframes):
                 pathname = self.frame_path(metadata.shot_id, "mask", frame)
                 if not pathname.is_file():
                     raise FileNotFoundError(f"Missing mask for frame {frame}: {pathname.name}")
@@ -336,11 +353,16 @@ class JobManager:
             job.progress = 0.20 * (index + 1) / len(frames)
 
         raw_masks = staged_masks
-        if keyframes:
+        if keyframes or request.sam2_points:
             job.stage = "tracking_sam2"
             job.current_frame = None
             raw_masks = directory / "sam2_masks"
-            run_sam2(self.config, staged_frames, seeds, raw_masks)
+            if request.sam2_points:
+                points = directory / "sam2_points.json"
+                points.write_text(json.dumps(request.sam2_points), encoding="utf-8")
+                run_sam2(self.config, staged_frames, seeds, raw_masks, points=points)
+            else:
+                run_sam2(self.config, staged_frames, seeds, raw_masks)
 
         job.stage = "preparing_masks"
         for index, frame in enumerate(frames):
@@ -558,6 +580,8 @@ class JobManager:
             "file_pattern": metadata.file_pattern,
             "first_frame": request.first_frame,
             "last_frame": request.last_frame,
+            "width": metadata.width,
+            "height": metadata.height,
             "color_management": metadata.color_management.value,
             "ocio_config_path": metadata.ocio_config_path,
             "source_colorspace": metadata.source_colorspace,

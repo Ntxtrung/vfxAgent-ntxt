@@ -149,6 +149,13 @@ def create_app(config: CoreConfig | None = None) -> FastAPI:
         save_upload(file, path)
         return {"saved": path.as_posix()}
 
+    @app.get("/api/shots/{shot_id}/mask/{frame}")
+    def get_shot_mask(shot_id: str, frame: int) -> FileResponse:
+        path = manager.frame_path(shot_id, "mask", frame)
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"Mask for frame {frame} not found")
+        return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
+
     @app.post("/api/shots/{shot_id}/reference")
     def upload_reference(
         shot_id: str,
@@ -176,6 +183,17 @@ def create_app(config: CoreConfig | None = None) -> FastAPI:
             return asdict(manager.get_job(job_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/jobs/{job_id}/manifest")
+    def download_manifest(job_id: str) -> FileResponse:
+        try:
+            job = manager.get_job(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        path = Path(job.apply_manifest_path)
+        if job.status != JobStatus.COMPLETED or not path.is_file():
+            raise HTTPException(status_code=404, detail="Apply manifest is not available")
+        return FileResponse(path, media_type="application/json", filename=f"apply_{job_id}.json")
 
     @app.post("/api/shots/{shot_id}/apply")
     def apply_to_nuke(shot_id: str, payload: ApplyPayload) -> dict[str, Any]:

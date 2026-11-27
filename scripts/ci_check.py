@@ -173,7 +173,10 @@ def check_compile() -> list[str]:
 
     ui_tsconfig = ROOT / "src/ui/tsconfig.json"
     if ui_tsconfig.is_file():
-        code, out = _run_cmd(["npx", "tsc", "--noEmit"], ROOT / "src/ui")
+        tsc = ROOT / "src/ui/node_modules/typescript/bin/tsc"
+        if not tsc.is_file():
+            return [*errors, "[COMPILE] Run npm ci --prefix src/ui before TypeScript checks"]
+        code, out = _run_cmd(["node", str(tsc), "--noEmit"], ROOT / "src/ui")
         if code != 0:
             errors.append(f"[COMPILE] TypeScript tsc --noEmit failed:\n{out}")
 

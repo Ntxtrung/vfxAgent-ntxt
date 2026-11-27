@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from src.contracts.models import ColorManagementMode, MediaKind
@@ -17,7 +18,8 @@ _EXT_TO_MEDIA: dict[str, MediaKind] = {
 
 def detect_media_kind(file_pattern: str) -> MediaKind:
     """Infer MediaKind from a Nuke Read file path or frame pattern."""
-    suffix = Path(file_pattern.split()[0]).suffix.lower()
+    path = re.sub(r"\s+-?\d+\s*-\s*-?\d+\s*$", "", file_pattern.strip())
+    suffix = Path(path).suffix.lower()
     if suffix not in _EXT_TO_MEDIA:
         supported = ", ".join(sorted(_EXT_TO_MEDIA))
         raise ValueError(f"Unsupported footage extension '{suffix}'. Expected one of: {supported}")

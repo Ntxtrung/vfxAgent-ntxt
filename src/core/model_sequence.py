@@ -49,21 +49,22 @@ def run_engine(command: list[str], log: Path, *, cwd: Path) -> None:
         raise RuntimeError(f"{log.stem} exited with code {result.returncode}: {detail}")
 
 
-def run_sam2(config: CoreConfig, frames: Path, seeds: Path, destination: Path) -> None:
+def run_sam2(
+    config: CoreConfig, frames: Path, seeds: Path, destination: Path, *, points: Path | None = None
+) -> None:
     worker = Path(__file__).with_name("sam2_worker.py").resolve()
-    run_engine(
-        [
-            str(config.model_python),
-            str(worker),
-            str(frames),
-            str(seeds),
-            str(destination),
-            config.sam2_model_config,
-            str(config.sam2_checkpoint),
-        ],
-        destination.parent / "sam2.log",
-        cwd=destination.parent,
-    )
+    command = [
+        str(config.model_python),
+        str(worker),
+        str(frames),
+        str(seeds),
+        str(destination),
+        config.sam2_model_config,
+        str(config.sam2_checkpoint),
+    ]
+    if points is not None:
+        command.extend(["--points", str(points)])
+    run_engine(command, destination.parent / "sam2.log", cwd=destination.parent)
 
 
 def run_propainter(
