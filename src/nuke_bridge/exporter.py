@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from src.contracts.models import ColorManagementMode, ShotMetadata
+from src.contracts.models import ColorManagementMode, MediaKind, ShotMetadata
 from src.nuke_bridge.colorspace import (
     detect_color_management,
     detect_media_kind,
@@ -35,6 +35,15 @@ def resolve_cache_dir(cache_root: str | Path | None = None) -> Path:
     """Resolve cache root from argument or CACHE_DIR environment variable."""
     raw = str(cache_root) if cache_root is not None else os.environ.get("CACHE_DIR", "./cache")
     return Path(raw).expanduser().resolve()
+
+
+def _uses_aces_exr_default(mode: ColorManagementMode, kind: MediaKind, colorspace: str) -> bool:
+    name = colorspace.strip().lower()
+    return (
+        mode == ColorManagementMode.ACES_1_2
+        and kind == MediaKind.EXR
+        and (name == "default" or name.startswith("default ("))
+    )
 
 
 def extract_shot_metadata(
@@ -68,11 +77,17 @@ def extract_shot_metadata(
     working_knob = str(root["workingSpaceLUT"].value()) if "workingSpaceLUT" in root.knobs() else ""
 
     cm_mode = detect_color_management(cm_knob, ocio_knob)
-    source_cs = normalize_colorspace_name(
-        str(read_node["colorspace"].value()),
-        fallback=normalize_colorspace_name(working_knob, "linear"),
-    )
+    read_colorspace = str(read_node["colorspace"].value())
     working_cs = normalize_colorspace_name(working_knob, "linear")
+    source_cs = normalize_colorspace_name(
+        read_colorspace,
+        fallback=working_cs,
+    )
+    if _uses_aces_exr_default(cm_mode, media_kind, read_colorspace):
+        float_lut = str(root["floatLut"].value()) if "floatLut" in root.knobs() else ""
+        source_cs = normalize_colorspace_name(float_lut, source_cs)
+        if source_cs in {"default", "linear", "scene_linear"}:
+            source_cs = "ACES - ACEScg"
     ai_prep_cs = resolve_ai_prep_colorspace(cm_mode, source_cs)
 
     shot_id = _sanitize_shot_id(shot_id or node_name)
@@ -123,7 +138,15 @@ def export_prep_sequence(
     cs_node = create_color_transform(
         nuke, metadata.color_management, metadata.working_colorspace, metadata.ai_prep_colorspace
     )
+    colorspace = read_node["colorspace"]
+    original_colorspace = str(colorspace.value())
+    use_explicit_source = _uses_aces_exr_default(
+        metadata.color_management, metadata.media_kind, original_colorspace
+    ) and not ("raw" in read_node.knobs() and read_node["raw"].value())
     try:
+        # Nuke 15 can decode an untagged ACES EXR through the display transform with Read's default.
+        if use_explicit_source:
+            colorspace.setValue(metadata.source_colorspace)
         cs_node.setInput(0, read_node)
         render_cache_png(
             nuke,
@@ -133,7 +156,11 @@ def export_prep_sequence(
             metadata.last_frame,
         )
     finally:
-        nuke.delete(cs_node)
+        try:
+            if use_explicit_source:
+                colorspace.setValue("default")
+        finally:
+            nuke.delete(cs_node)
 
     meta_path = out_pattern.parent.parent / "shot_metadata.json"
     metadata.save(meta_path)

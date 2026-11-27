@@ -22,6 +22,7 @@
 ### F1 — Nuke Bridge: Đọc `Read` & Chuẩn hóa đầu vào cho ComfyUI
 - **Trạng thái**: `[x] Verified`
 - **Mô tả**: Lấy metadata từ node `Read` (EXR/DPX/MOV/MP4, frame range, colorspace), convert sang chuẩn trung gian cho AI (PNG 16-bit sRGB/Output - sRGB) vào cache của shot.
+- **ACES 1.2 trên Nuke 15.1**: Khi `Read.colorspace` ở `default` cho EXR, exporter đặt tạm colorspace EXR theo float LUT của project và trả knob về `default` sau khi xuất. Frame EXR đối chứng đã khớp với transform ACES `scene_linear` → `Output - sRGB` và với bản render đặt `Read` thành ACEScg trực tiếp. Cache từ trước bản sửa cần được xuất lại để dùng đúng pixel sRGB.
 - **Thư mục**: `src/nuke_bridge/`, `src/contracts/`
 - **Chạy thử / Test**: `python -m unittest discover -s tests -v`
 
@@ -74,6 +75,8 @@ Kiểm thử trên năm frame EXR 2048 × 802. Hai job, tự dựng nền và d�
 5. `GET /api/jobs/{job_id}` báo tiến độ và lỗi runtime. `sam2.log` và `propainter.log` nằm trong thư mục job. ProPainter trả ảnh qua `GET /api/jobs/{job_id}/result/{frame}` và lưu manifest sequence cho F4.
 
 Kiểm thử thực tế trên 11 frame EXR 2048 × 802 với ba mask keyframe. SAM 2 phủ 98,6–99,4% roto đối chứng ở tám frame không được gán mask đầu vào. ProPainter trả đủ patch, giữ nguyên pixel cache ngoài mask, và vẫn có vân nhiễu, phản sáng sót cùng dao động độ sáng trong vùng nền bị che lâu. Bản thử cạnh dài 1280 px và nới mask rộng hơn cải thiện độ phủ nhưng dao động mạnh hơn bản 1024 px trên shot này.
+
+Sau khi sửa cách đọc EXR ACES mặc định, đã xuất lại và chạy lại đủ 11 frame bằng cùng cấu hình 1024 px. SAM 2 phủ 98,6–99,5% ở các frame tự track. Vùng inpaint vẫn dao động và còn vân ở mép. Cặp mạnh nhất là 1040–1041 với chênh lệch độ sáng trung bình 13,2/255 sau khi bù chuyển động camera.
 
 ---
 

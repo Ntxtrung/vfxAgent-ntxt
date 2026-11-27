@@ -90,6 +90,7 @@ class _FakeNuke:
         self._root = _FakeNode("root", root_knobs)
         self.created_nodes: list[tuple[str, dict[str, Any], _FakeNode]] = []
         self.executed: list[tuple[str, int, int]] = []
+        self.rendered_source_colorspaces: list[str] = []
         self.deleted: list[str] = []
         self.nodes = _FakeNodesFactory(self.created_nodes)
 
@@ -98,6 +99,8 @@ class _FakeNuke:
 
     def execute(self, node: _FakeNode, first: int, last: int) -> None:
         self.executed.append((node.name(), first, last))
+        read_node = node.inputs[0].inputs[0]
+        self.rendered_source_colorspaces.append(read_node["colorspace"].value())
 
     def delete(self, node: _FakeNode) -> None:
         self.deleted.append(node.name())
@@ -138,6 +141,7 @@ class TestNukeExporter(unittest.TestCase):
                 "colorManagement": "OCIO",
                 "OCIO_config": "aces_1.2",
                 "workingSpaceLUT": "ACES - ACEScg",
+                "floatLut": "scene_linear",
             }
         )
         read_node = _FakeNode(
@@ -146,7 +150,7 @@ class TestNukeExporter(unittest.TestCase):
                 "file": "G:/shots/sh010/plate.%04d.exr",
                 "first": 1001,
                 "last": 1024,
-                "colorspace": "default (ACES - ACEScg)",
+                "colorspace": "default (linear)",
             },
             fmt=_FakeFormat(3840, 2160),
         )
@@ -163,6 +167,8 @@ class TestNukeExporter(unittest.TestCase):
             self.assertEqual(fake_nuke.created_nodes[1][0], "Write")
             self.assertEqual(fake_nuke.executed, [("Write1", 1001, 1024)])
             self.assertEqual(fake_nuke.deleted, ["Write1", "OCIOColorSpace1"])
+            self.assertEqual(fake_nuke.rendered_source_colorspaces, ["ACES - ACEScg"])
+            self.assertEqual(read_node["colorspace"].value(), "default")
 
             saved_json = Path(tmp) / "Read_Shot01" / "shot_metadata.json"
             self.assertTrue(saved_json.is_file())
