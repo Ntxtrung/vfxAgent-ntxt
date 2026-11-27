@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+from shutil import copyfileobj
+from tempfile import NamedTemporaryFile
 from typing import Annotated, Any
+from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,12 +35,26 @@ class JobCreatePayload(BaseModel):
     seed: int = 42
     sam2_points: list[dict[str, float | int]] = Field(default_factory=list)
     negative_prompt: str = ""
+    anchor_frame: int | None = None
 
 
 class ApplyPayload(BaseModel):
     """HTTP request body for writing Nuke F4 auto-composite manifest."""
 
     enable_grain: bool = True
+
+
+def save_upload(file: UploadFile, path: Path) -> None:
+    """Publish the complete upload in one rename so readers see a whole file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        with temporary.open("wb") as handle:
+            copyfileobj(file.file, handle)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def create_app(config: CoreConfig | None = None) -> FastAPI:
@@ -112,24 +129,23 @@ def create_app(config: CoreConfig | None = None) -> FastAPI:
         return FileResponse(path, media_type="image/png")
 
     @app.post("/api/shots/{shot_id}/mask/{frame}")
-    async def upload_mask(
+    def upload_mask(
         shot_id: str,
         frame: int,
         file: Annotated[UploadFile, File()],
     ) -> dict[str, str]:
         path = manager.frame_path(shot_id, "mask", frame)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(await file.read())
+        save_upload(file, path)
         return {"saved": path.as_posix()}
 
     @app.post("/api/shots/{shot_id}/reference")
-    async def upload_reference(
+    def upload_reference(
         shot_id: str,
         file: Annotated[UploadFile, File()],
     ) -> dict[str, str]:
-        ref_path = cfg.cache_dir / shot_id / "ref" / (file.filename or "reference.png")
-        ref_path.parent.mkdir(parents=True, exist_ok=True)
-        ref_path.write_bytes(await file.read())
+        suffix = Path(file.filename or "reference.png").suffix
+        ref_path = cfg.cache_dir / shot_id / "ref" / f"{uuid4().hex}{suffix}"
+        save_upload(file, ref_path)
         return {"reference_image_path": ref_path.as_posix()}
 
     @app.post("/api/jobs")

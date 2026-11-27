@@ -49,6 +49,7 @@ class RemoveMode(_StringEnum):
     CLEAN_PLATE_REF = "clean_plate_ref"
     PROMPT_REF_INPAINT = "prompt_ref_inpaint"
     SINGLE_FRAME_INPAINT = "single_frame_inpaint"
+    TRACKED_CLEAN_PLATE = "tracked_clean_plate"
 
 
 @dataclass(slots=True)
@@ -124,6 +125,7 @@ class RemoveJobRequest:
     seed: int = 42
     sam2_points: list[dict[str, float | int]] = field(default_factory=list)
     negative_prompt: str = ""
+    anchor_frame: int | None = None
 
 
 @dataclass(slots=True)
@@ -138,3 +140,5 @@ class RemoveJobResponse:
     result_mask_pattern: str = ""
     error_message: str = ""
     apply_manifest_path: str = ""
+    stage: str = "queued"
+    current_frame: int | None = None

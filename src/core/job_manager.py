@@ -8,7 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
@@ -22,6 +22,9 @@ from src.contracts.models import (
     ShotMetadata,
 )
 from src.core.comfy_client import ComfyUIClient
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 
 class JobManager:
@@ -115,9 +118,13 @@ class JobManager:
         """Enqueue a removal/inpaint job on the background worker thread."""
         metadata = self.get_shot(request.shot_id)
         single_frame = request.mode == RemoveMode.SINGLE_FRAME_INPAINT
-        if single_frame:
+        sequence = request.mode == RemoveMode.TRACKED_CLEAN_PLATE
+        if single_frame or (sequence and not request.reference_image_path):
             if not self.inpaint_checkpoint:
                 raise ValueError("Set COMFYUI_INPAINT_CHECKPOINT to a local checkpoint name")
+            if not request.prompt.strip():
+                raise ValueError("Provide a prompt describing the background to reconstruct")
+        if single_frame:
             if not (
                 metadata.first_frame
                 == request.first_frame
@@ -125,15 +132,32 @@ class JobManager:
                 == metadata.last_frame
             ):
                 raise ValueError("Prepare and submit exactly one frame for single_frame_inpaint")
-            if not request.prompt.strip():
-                raise ValueError("Provide a prompt describing the background to reconstruct")
+        elif sequence:
+            if (
+                not metadata.first_frame
+                <= request.first_frame
+                < request.last_frame
+                <= (metadata.last_frame)
+            ):
+                raise ValueError("Submit at least two frames within the prepared shot range")
+            if request.anchor_frame is not None and not (
+                request.first_frame <= request.anchor_frame <= request.last_frame
+            ):
+                raise ValueError("The anchor frame must be inside the requested job range")
+            if request.reference_image_path:
+                location = Path(request.reference_image_path).resolve()
+                ref_dir = (self.cache_dir / metadata.shot_id / "ref").resolve()
+                if not location.is_relative_to(ref_dir) or not location.is_file():
+                    raise ValueError(
+                        "Upload the clean plate to the reference endpoint for this shot"
+                    )
         elif not metadata.is_demo:
-            raise ValueError("Nuke footage currently requires single_frame_inpaint")
+            raise ValueError("Nuke footage requires single_frame_inpaint or tracked_clean_plate")
         job_id = uuid.uuid4().hex[:12]
         shot_dir = self.cache_dir / metadata.shot_id
         result_dir = shot_dir / "result"
         mask_dir = shot_dir / "masks"
-        if single_frame:
+        if single_frame or sequence:
             result_dir = mask_dir = shot_dir / "jobs" / job_id
 
         job = RemoveJobResponse(
@@ -162,15 +186,20 @@ class JobManager:
     ) -> None:
         """Execute removal pipeline in background thread (never blocks UI/API)."""
         job = self._jobs[job_id]
+        job.stage = "preparing"
         job.status = JobStatus.RUNNING
         self.logger.info("Starting job %s for shot %s (%s)", job_id, metadata.shot_id, request.mode)
 
         try:
-            if request.mode == RemoveMode.SINGLE_FRAME_INPAINT:
-                self._run_single_frame(job, request, metadata)
-                job.status = JobStatus.COMPLETED
+            if request.mode in (RemoveMode.SINGLE_FRAME_INPAINT, RemoveMode.TRACKED_CLEAN_PLATE):
+                if request.mode == RemoveMode.SINGLE_FRAME_INPAINT:
+                    self._run_single_frame(job, request, metadata)
+                else:
+                    self._run_sequence(job, request, metadata)
+                job.stage = "completed"
                 job.progress = 1.0
-                self.logger.info("Completed ComfyUI inpaint job %s", job_id)
+                job.status = JobStatus.COMPLETED
+                self.logger.info("Completed removal job %s", job_id)
                 return
 
             workflow = self.comfy_client.build_workflow(request, metadata)
@@ -209,12 +238,13 @@ class JobManager:
 
                 job.progress = round((idx + 1) / total, 3)
 
-            job.status = JobStatus.COMPLETED
+            job.stage = "completed"
             job.progress = 1.0
+            job.status = JobStatus.COMPLETED
             self.logger.info("Completed job %s for shot %s", job_id, metadata.shot_id)
         except Exception as exc:
-            job.status = JobStatus.FAILED
             job.error_message = str(exc)
+            job.status = JobStatus.FAILED
             self.logger.exception("Job %s failed: %s", job_id, exc)
 
     def _run_single_frame(
@@ -237,7 +267,99 @@ class JobManager:
             mask.save(mask_snapshot)
             plate = image.convert("RGB")
 
+        job.current_frame = frame
+        result_image, prompt_id = self._inpaint_patch(plate, mask, job, request, result.parent)
+        result_image.save(result)
+        self._write_job_manifest(job, request, metadata, prompt_id, frame)
+
+    def _run_sequence(
+        self, job: RemoveJobResponse, request: RemoveJobRequest, metadata: ShotMetadata
+    ) -> None:
+        try:
+            from src.core.sequence import (
+                BackgroundTracker,
+                CleanPlateBuilder,
+                merge_generated,
+                read_mask,
+                read_plate,
+                track_patch,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"cv2", "numpy"}:
+                raise
+            raise RuntimeError("Install opencv-python-headless in the Core environment") from exc
+
+        size = (metadata.width, metadata.height)
+        frames = range(request.first_frame, request.last_frame + 1)
+        anchor_frame = request.anchor_frame
+        if anchor_frame is None:
+            anchor_frame = (request.first_frame + request.last_frame) // 2
+        directory = Path(job.result_sequence_pattern % anchor_frame).parent
+        directory.mkdir(parents=True, exist_ok=True)
+
+        def load_mask(frame: int) -> NDArray:
+            mask = self.frame_path(metadata.shot_id, "mask", frame)
+            if not mask.is_file():
+                raise FileNotFoundError(f"Missing mask for frame {frame}: {mask.name}")
+            return read_mask(mask, size)
+
+        job.current_frame = anchor_frame
+        anchor = read_plate(self.frame_path(metadata.shot_id, "input", anchor_frame), size)
+        tracker = BackgroundTracker(anchor, load_mask(anchor_frame))
+        builder = None if request.reference_image_path else CleanPlateBuilder(size)
+        transforms = {}
+        job.stage = "tracking_background"
+        for index, frame in enumerate(frames):
+            job.current_frame = frame
+            plate = read_plate(self.frame_path(metadata.shot_id, "input", frame), size)
+            mask = load_mask(frame)
+            Image.fromarray(mask).save(job.result_mask_pattern % frame)
+            warp = (
+                tracker.identity() if frame == anchor_frame else tracker.align(plate, mask, frame)
+            )
+            transforms[frame] = warp
+            if builder is not None:
+                builder.add(plate, mask, warp, frame - anchor_frame)
+            job.progress = 0.05 + 0.35 * (index + 1) / len(frames)
+
+        prompt_id = ""
+        if builder is None:
+            clean = read_plate(Path(request.reference_image_path), size)
+        else:
+            clean, missing, known = builder.build()
+            if missing.getbbox():
+                job.current_frame = anchor_frame
+                generated, prompt_id = self._inpaint_patch(clean, missing, job, request, directory)
+                clean = merge_generated(clean, generated, missing, known)
+        clean.save(directory / "clean_anchor.png")
+        tracking = {frame: warp.tolist() for frame, warp in transforms.items()}
+        (directory / "tracking.json").write_text(json.dumps(tracking, indent=2), encoding="utf-8")
+
+        job.stage = "writing_frames"
+        for index, frame in enumerate(frames):
+            job.current_frame = frame
+            plate = read_plate(self.frame_path(metadata.shot_id, "input", frame), size)
+            snapshot = read_mask(Path(job.result_mask_pattern % frame), size)
+            track_patch(plate, clean, snapshot, transforms[frame]).save(
+                job.result_sequence_pattern % frame
+            )
+            job.progress = 0.65 + 0.34 * (index + 1) / len(frames)
+        self._write_job_manifest(job, request, metadata, prompt_id, anchor_frame)
+
+    def _inpaint_patch(
+        self,
+        plate: Image.Image,
+        mask: Image.Image,
+        job: RemoveJobResponse,
+        request: RemoveJobRequest,
+        directory: Path,
+    ) -> tuple[Image.Image, str]:
+        bounds = mask.getbbox()
+        if bounds is None:
+            raise ValueError("The inpaint mask is empty")
+
         left, top, right, bottom = bounds
+        size = plate.size
         context = 112
         crop_box = (
             max(0, left - context),
@@ -250,12 +372,13 @@ class JobManager:
         ai_input.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
         ai_mask = mask.crop(crop_box).resize(ai_input.size, Image.Resampling.LANCZOS)
         padding = (0, 0, -ai_input.width % 8, -ai_input.height % 8)
-        input_crop = result.parent / "input_crop.png"
-        mask_crop = result.parent / "mask_crop.png"
+        input_crop = directory / "input_crop.png"
+        mask_crop = directory / "mask_crop.png"
         ImageOps.expand(ai_input, padding).save(input_crop)
         ImageOps.expand(ai_mask, padding).save(mask_crop)
 
         subfolder = f"comfyremove/{job.job_id}"
+        job.stage = "submitting_to_comfyui"
         workflow = self.comfy_client.single_frame_workflow(
             self.comfy_client.upload_image(input_crop, subfolder),
             self.comfy_client.upload_image(mask_crop, subfolder),
@@ -264,10 +387,11 @@ class JobManager:
             request.seed,
             request.negative_prompt,
         )
-        workflow_path = result.parent / "workflow.json"
+        workflow_path = directory / "workflow.json"
         workflow_path.write_text(json.dumps(workflow, indent=2), encoding="utf-8")
         prompt_id = self.comfy_client.queue_prompt(workflow)
         self.logger.info("ComfyUI prompt %s for job %s", prompt_id, job.job_id)
+        job.stage = "waiting_for_comfyui"
         job.progress = 0.5
         patch = self.comfy_client.wait_for_patch(prompt_id)
         with Image.open(BytesIO(patch)) as image:
@@ -278,16 +402,28 @@ class JobManager:
             patch_crop = image.crop((0, 0, ai_input.width, ai_input.height)).resize(
                 crop.size, Image.Resampling.LANCZOS
             )
-            plate.paste(patch_crop, crop_box[:2])
-        plate.save(result)
+        result_image = plate.copy()
+        result_image.paste(patch_crop, crop_box[:2])
+        return result_image, prompt_id
+
+    def _write_job_manifest(
+        self,
+        job: RemoveJobResponse,
+        request: RemoveJobRequest,
+        metadata: ShotMetadata,
+        prompt_id: str,
+        anchor_frame: int,
+    ) -> None:
         manifest = {
             "job_id": job.job_id,
             "comfy_prompt_id": prompt_id,
+            "processing_mode": request.mode.value,
+            "anchor_frame": anchor_frame,
             "shot_id": metadata.shot_id,
             "node_name": metadata.node_name,
             "file_pattern": metadata.file_pattern,
-            "first_frame": frame,
-            "last_frame": frame,
+            "first_frame": request.first_frame,
+            "last_frame": request.last_frame,
             "color_management": metadata.color_management.value,
             "ocio_config_path": metadata.ocio_config_path,
             "source_colorspace": metadata.source_colorspace,
@@ -296,7 +432,9 @@ class JobManager:
             "result_sequence_pattern": job.result_sequence_pattern,
             "result_mask_pattern": job.result_mask_pattern,
         }
-        manifest_path = result.parent / "apply_manifest.json"
+        manifest_path = (
+            Path(job.result_sequence_pattern % anchor_frame).parent / "apply_manifest.json"
+        )
         pending_manifest = manifest_path.with_suffix(".tmp")
         pending_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         pending_manifest.replace(manifest_path)
@@ -325,7 +463,7 @@ class JobManager:
         """Write apply_manifest.json for Nuke F4 auto-composite."""
         metadata = self.get_shot(shot_id)
         if not metadata.is_demo:
-            raise ValueError("Use apply_manifest_path from the completed single-frame job")
+            raise ValueError("Use apply_manifest_path from the completed job")
         result_pattern = (
             self.cache_dir / shot_id / "result" / f"{shot_id}_result.%04d.png"
         ).as_posix()

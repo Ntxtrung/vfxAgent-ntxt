@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import io
 import json
+import random
 import tempfile
 import time
 import unittest
 from dataclasses import replace
+from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from src.contracts.models import JobStatus, RemoveJobRequest, RemoveMode, ShotMetadata
 from src.core.comfy_client import ComfyUIClient
@@ -172,6 +174,100 @@ class TestCoreAPI(unittest.TestCase):
                 self.assertEqual(result.getpixel((20, 15)), (10, 177, 80))
             with Image.open(manifest["result_mask_pattern"] % 1001) as snapshot:
                 self.assertEqual(snapshot.tobytes(), mask.tobytes())
+
+    @unittest.skipUnless(find_spec("cv2"), "Install OpenCV to exercise sequence processing")
+    def test_sequence_inpaints_once_and_tracks_one_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = CoreConfig(cache_dir=root, logs_dir=root / "logs", inpaint_checkpoint="local")
+            client = TestClient(create_app(cfg))
+            demo = client.post("/api/shots/demo?shot_id=seq&num_frames=3").json()
+            metadata = replace(
+                ShotMetadata.from_json(json.dumps(demo)), width=256, height=192, is_demo=False
+            )
+            metadata.save(root / "seq" / "shot_metadata.json")
+            background = Image.new("RGB", (256, 192), (20, 30, 45))
+            draw = ImageDraw.Draw(background)
+            rng = random.Random(16)
+            for _ in range(260):
+                x, y = rng.randrange(240), rng.randrange(176)
+                value = rng.randrange(50, 220)
+                draw.ellipse((x, y, x + 6, y + 6), fill=(value, value, value))
+            mask_dir = root / "seq" / "masks"
+            mask_dir.mkdir()
+            for index, frame in enumerate(range(1001, 1004)):
+                plate = Image.new("RGB", background.size)
+                plate.paste(background, (index * 4, 0))
+                mask = Image.new("L", background.size)
+                box = (90 + index * 4, 70, 160 + index * 4, 140)
+                mask.paste(255, box)
+                plate.paste((240, 40, 25), box)
+                mask.save(mask_dir / f"seq_mask.{frame}.png")
+                plate.save(metadata.cache_sequence_pattern % frame)
+
+            def fake_patch(_prompt_id: str) -> bytes:
+                input_file = upload.call_args_list[0].args[0]
+                buffer = io.BytesIO()
+                with Image.open(input_file) as image:
+                    Image.new("RGB", image.size, (20, 170, 80)).save(buffer, format="PNG")
+                return buffer.getvalue()
+
+            payload = {
+                "shot_id": "seq",
+                "mode": "tracked_clean_plate",
+                "first_frame": 1001,
+                "last_frame": 1003,
+                "prompt": "Rebuild the wall",
+            }
+            with (
+                patch.object(
+                    ComfyUIClient, "upload_image", side_effect=["src.png", "mask.png"]
+                ) as upload,
+                patch.object(ComfyUIClient, "queue_prompt", return_value="one-prompt") as submit,
+                patch.object(ComfyUIClient, "wait_for_patch", side_effect=fake_patch),
+            ):
+                response = client.post("/api/jobs", json=payload)
+                self.assertEqual(response.status_code, 200)
+                job = self._wait_for_job(client, response.json()["job_id"])
+            self.assertEqual(job["status"], "completed", job["error_message"])
+            self.assertEqual(job["current_frame"], 1003)
+            self.assertEqual(submit.call_count, 1)
+            path = Path(job["apply_manifest_path"])
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["anchor_frame"], 1002)
+            self.assertEqual(manifest["comfy_prompt_id"], "one-prompt")
+            transforms = json.loads((path.parent / "tracking.json").read_text(encoding="utf-8"))
+            self.assertAlmostEqual(transforms["1001"][0][2], 4, delta=1)
+            self.assertAlmostEqual(transforms["1003"][0][2], -4, delta=1)
+            patch_pixels = []
+            for index, frame in enumerate(range(1001, 1004)):
+                response = client.get(f"/api/jobs/{job['job_id']}/result/{frame}")
+                self.assertEqual(response.status_code, 200)
+                with Image.open(io.BytesIO(response.content)) as result:
+                    patch_pixels.append(result.getpixel((123 + index * 4, 100)))
+                    with Image.open(metadata.cache_sequence_pattern % frame) as plate:
+                        self.assertEqual(result.getpixel((15, 15)), plate.getpixel((15, 15)))
+            self.assertLess(max(pixel[0] for pixel in patch_pixels), 120)
+            for value, anchor in zip(patch_pixels[0], patch_pixels[2], strict=True):
+                self.assertAlmostEqual(value, anchor, delta=4)
+
+            (mask_dir / "seq_mask.1003.png").unlink()
+            response = client.post("/api/jobs", json=payload)
+            job = self._wait_for_job(client, response.json()["job_id"])
+            self.assertEqual(job["status"], "failed")
+            self.assertIn("Missing mask for frame 1003", job["error_message"])
+            self.assertEqual(job["current_frame"], 1003)
+            self.assertEqual(job["apply_manifest_path"], "")
+            self.assertEqual(client.get(f"/api/jobs/{job['job_id']}/result/1001").status_code, 404)
+
+    @staticmethod
+    def _wait_for_job(client: TestClient, job_id: str) -> dict:
+        for _ in range(180):
+            job = client.get(f"/api/jobs/{job_id}").json()
+            if job["status"] in ("completed", "failed"):
+                return job
+            time.sleep(0.02)
+        raise AssertionError(f"Job {job_id} did not finish")
 
 
 if __name__ == "__main__":

@@ -26,8 +26,8 @@
 - **Chạy thử / Test**: `python -m unittest discover -s tests -v`
 
 ### F2 — Tiến trình chính (Core API) & Kết nối ComfyUI
-- **Trạng thái**: `[~] In Progress`. Luồng `single_frame_inpaint` đã chạy trên ComfyUI cục bộ với EXR 2048 × 802 và mask Nuke.
-- **Mô tả**: FastAPI quản lý hàng đợi nền và gửi ảnh cùng mask dạng file PNG sang ComfyUI. Job một frame giữ các bản mask, patch và manifest riêng theo `job_id`. Các chế độ AI theo chuỗi như ProPainter và SAM 2 vẫn trong kế hoạch. Job mô phỏng Pillow chỉ dùng với shot demo.
+- **Trạng thái**: `[~] In Progress`. Có job `single_frame_inpaint` và `tracked_clean_plate`, cùng dùng ảnh đã chuẩn màu từ Nuke và mask rời theo frame.
+- **Mô tả**: FastAPI quản lý hàng đợi nền. Với sequence, Core track nền về một frame mốc, gom phần nền lộ ra và dùng tối đa một lần inpaint ComfyUI cho vùng còn thiếu. Core dùng màu của nền quan sát được để cân lại phần sinh. Có thể cung cấp clean plate đã duyệt tại frame mốc. Mỗi job lưu riêng patch, mask và manifest, kèm `stage` và `current_frame` khi polling. Job mô phỏng Pillow dành cho shot demo. SAM 2 và ProPainter là các chế độ riêng đang chờ triển khai.
 - **Thư mục**: `src/core/`
 - **Chạy thử / Test**: `python -m pytest tests/test_core_api.py`
 
@@ -53,6 +53,18 @@
 
 Core cắt vùng quanh mask và thu nhỏ đầu vào AI nếu cạnh dài vượt 1024 px. Patch được đặt lại đúng kích thước footage trước khi Nuke ghép. Vùng bị che rộng cần đánh giá lại màu, hình học và texture của nền được tạo.
 
+### Chạy một job clean plate qua nhiều frame
+
+1. Cài OpenCV vào môi trường Core bằng `.venv/Scripts/python.exe -m pip install opencv-python-headless`.
+2. Dùng `export_prep_sequence` trong Nuke Bridge để chuẩn bị frame range. Tải một mask PNG cùng kích thước cho mỗi frame qua `POST /api/shots/{shot_id}/mask/{frame}`. Mask grayscale hoặc kênh đỏ RGB dùng giá trị trắng cho vùng sửa. Dùng mask đen cho frame cần giữ nguyên.
+3. Gửi `POST /api/jobs` với `mode: tracked_clean_plate`, `shot_id`, `first_frame` và `last_frame`. Có thể chỉ định `anchor_frame`, mặc định là giữa đoạn. Để tự dựng clean plate, điền `prompt` và cấu hình checkpoint ComfyUI như job một frame. Để dùng clean plate đã duyệt, tải PNG của frame mốc trong cùng AI prep colorspace qua `POST /api/shots/{shot_id}/reference`, rồi gửi `reference_image_path` trả về cùng `anchor_frame` tương ứng.
+4. Poll `GET /api/jobs/{job_id}`. Sequence báo `tracking_background`, `submitting_to_comfyui` và `waiting_for_comfyui` khi cần inpaint, rồi `writing_frames`. Job báo rõ frame nếu thiếu mask hoặc tracking mất bám. Khi hoàn thành, dùng `GET /api/jobs/{job_id}/result/{frame}` để xem patch. Mask theo frame được lưu cạnh patch để điều khiển độ hòa trộn trong Nuke.
+5. Manifest sequence lưu frame range, frame mốc, đường dẫn patch và mask, cùng colorspace cho F4. `tracking.json` lưu phép biến đổi frame về mốc. Luồng F4 tự dựng graph từ manifest sequence là hạng mục tiếp theo.
+
+Tracking nền hiện dùng một phép biến đổi toàn cục cho mỗi frame. Kết quả phù hợp nhất với đoạn ngắn đủ chi tiết nền chung. Camera parallax mạnh, đổi góc hoặc vùng nền bị che nhiều cần kiểm tra patch và mép mask trong Nuke.
+
+Kiểm thử trên năm frame EXR 2048 × 802. Hai job, tự dựng nền và dùng clean plate tham chiếu, đều trả đủ patch và mask. Chế độ tự dựng gọi ComfyUI một lần. Trên shot này, clean plate tham chiếu giữ bố cục nền sát hơn ở vùng bị che lớn.
+
 ---
 
 ## Quy trình mở chạy thử, bắt lỗi & tự động sửa
@@ -63,8 +75,8 @@ Core cắt vùng quanh mask và thu nhỏ đầu vào AI nếu cạnh dài vư�
 ---
 
 ## Handoff & Next Steps (Cập nhật mỗi lần push GitHub)
-- **Trạng thái hiện tại**: F0 và F1 đã hoàn tất. F2 và F4 có luồng một frame với nguồn EXR thật, mask alpha từ Nuke, inpaint thật trên ComfyUI và graph ghép trong Nuke. F3 chưa triển khai.
+- **Trạng thái hiện tại**: F0 và F1 đã hoàn tất. F2 có job một frame và job nhiều frame dùng chung clean plate đã track. F4 tự ghép một frame. F3 chưa triển khai.
 - **Việc cần làm tiếp theo**:
-  1. Kiểm tra một đoạn EXR ngắn để đánh giá ổn định theo thời gian, VRAM và chất lượng vùng nền tái tạo.
+  1. Nối lệnh Apply của F4 với manifest sequence từ F2 và kiểm tra Difference trên toàn đoạn.
   2. Triển khai F3 trên API job thực tế, bắt đầu từ chọn shot, xem patch và trạng thái job.
-  3. Mở rộng F2/F4 cho sequence, tracking mask và hoàn thiện composite.
+  3. Mở rộng F2 với SAM 2 và ProPainter cho shot cần theo dõi mask hoặc inpaint theo thời gian.
